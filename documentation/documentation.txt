@@ -1,127 +1,146 @@
 Opdracht MQTT Weerstation
+
 Auteur: Luuk Elkink
 Studentnummer: 1642820
-Dit document hoort foto's te bevatten, dezen staan in de
-Deze code heeft de volgende functionaliteiten:
 
-•	Communicatie i2c sensor
-•	Wifi verbinding
-•	MQTT verbinding
-•	Windsnelheid/anemometer 
+Inleiding
 
-Ten eerste is het belangrijk te noemen dat als extra deel voor deze opdracht is gekozen het ESP-IDF framework te gebruiken in plaats van die van Arduino. Deze geeft meer controlle over specifieke aspecten van de esp, maar is hierdoor iets complexer. Platform-IO kan dit gewoon compileren en debuggen zonder wijziging van instellingen (deze zijn al gedefinieerd in het platformio.ini bestand.
-De functionaliteiten worden in het volgende deel individueel besproken. In de code zijn bepaalde delen gedetailleerder uitgelegd. De code is geschreven met de hulp van de ESP-IDF documentatie en de voorbeelden hierin: https://docs.espressif.com/projects/esp-idf/en/stable/esp32/
-App_Main()
+Dit document beschrijft de code voor een ESP32 microcontroller die sensordata verzamelt en verstuurt via MQTT. De code omvat functionaliteit voor:
 
-Dit is de code die runt wanneer het systeem opstart, hier worden alle functionaliteiten geinitialiseerd.
-In Figuur 1, Main staat het ruwe proces afgebeeld dat wordt doorlopen bij de initialisatie. 
+-   Communicatie met een I2C-sensor
+-   Wifi-verbinding
+-   MQTT-verbinding
+-   Windsnelheidsmeting met interrupt
 
-•	De i2c bus connectie wordt gemaakt. 
-•	De interrupt instellingen en event queue wordt geinitialiseerd
-•	De Wifi routine en verbinding wordt gemaakt
-•	De MQTT routine wordt geinitialiseerd
-•	De MQTT data verstuur taak wordt geinitialiseerd
+Gebruikte hardware:
 
-Communicatie i2c sensor
-De i2c sensor verbinding wordt gestart met de functie i2c_master_init(). Deze functie maakt gebruik van de i2c_master.h bibliotheek.
-Als eerste worden de instellingen van de master bus aangemaakt in de bus_config variabele van het type i2c_master_bus_config_t (struct uit library). Hierin worden de SDA en SCL pins gedefinieerd (in deze code SDA: 21 en SCL: 22), het poortnummer gekozen, de pullup weerstand geactiveerd en meer.
-Vervolgens wordt met de instellingen een master bus lijn aangemaakt met i2c_new_master_bus().
+-   ESP32 microcontroller
+-   I2C-sensor (type specificeren in de code)
+-   Windsensor (magneet relais, filtering etc.)
 
-Nu moet een connectie worden geregistreerd bij de master bus. Eerst worden de instellingen van de connectie gemaakt en opgeslagen in de variabele dev_cfg van type i2c_device_config_t. Deze bestaat uit de adres lengte, het adres en verbindingssnelheid van de sensor (worden uit datasheet gehaald). Met de instellingen wordt een device op de main bus aangemaakt met i2c_master_bus_add_device(….). 
-De aangemaakte master bus en device worden opgeslagen in een statisch gealloceerde struct (i2c_zuyd_sensor) zodat deze altijd en overal beschikbaar zijn in het programma. Wanneer het aantal sensoren onbekend is bij opstarten, of geheugen dynamisch gealloceerd moet worden per sensor zal dit op een andere manier moeten worden geimplementeerd.
-De sensor wordt uitgelezen met de read_sensor_data(*i2c_device device) functie. Deze vereist een pointer naar een i2c device (de eerdergenoemde struct met de bus en device informatie), Hiervoor is gekozen zodat als meerdere sensoren worden aangesloten, dezelfde functie aangeroepen kan worden.
-De gemeten data wordt opgeslagen in wat statisch gealloceerd geheugen in een struct, bij iedere meting wordt over de vorige waarde heen geschrven.
-De read_sensor_data() functie creert wat geheugen voor het adres waaruit gelezen wordt ( uint8_t cmd[1]; )  hierin wordt het adres geladen voor de temperatuur meting: 
+Software:
 
-uint8_t cmd[1];
-cmd[0] = I2C_SENSOR_TEMP_REG;
+ESP-IDF framework
+PlatformIO IDE
 
-Dit adres wordt met een schrijfactie naar de sensor gestuurd om aan te geven dat deze meting gelezen moet worden. Vervolgens wordt kort gewacht zodat de sensor de meting kan doen:
+-- Functionaliteit in detail --
 
-ESP_ERROR_CHECK(i2c_master_transmit(device->dev_handle, cmd, sizeof(cmd), -1));
-vTaskDelay(pdMS_TO_TICKS(20));
+Als extra deel van de opdracht is gekozen niet het aduino framework te gebruiken maar het ESP-IDF framework.
+Deze geeft meer controle over de hardware en geheugen van de esp met de tradeoff dat de code iets complexer wordt.
+Verder is uitbundig onderzocht naar hoe interrupt routines werken, en zijn deze gebruikt op een non-blocking manier, waar de wifi, mqtt en i2c code blijven functioneren
+zelfs wanneer de interrupts gemaakt worden.
 
-twee bytes aan geheugen worden op de stack gealloceerd. Nu wordt geluisterd naar een reactie van de sensor, en wordt de reactie in dit geheugen opgeslagen:
+De delen van de code en de schakeling worden in het volgende deel beknopt uitgewerkt. Een nog uitgebreidere uitleg met afbeeldingen is te vinden in de bijgeleverde .pdf.
+Deze .pdf is gemaakt omdat ik origineel niet wist dat de documentatie in een .txt bestand moest, maar is veel duidelijker door de afbeeldingen. 
+Alle gebruikte bibliotheken zijn van espressif zelf, dus zijn niet opgenomen in een los dependancies document.
 
-uint8_t raw_data[2];
-ESP_ERROR_CHECK(i2c_master_receive(device->dev_handle, raw_data, sizeof(raw_data), -1));
+1. I2C-sensorcommunicatie
 
-De twee bytes worden gecombineerd door de eerste 8 bits naar links te verschuiven en vast te plakken aan de tweede byte. De resulterende waarde wordt gebruikt in de temperatuur calculatie uit de sensor datasheet en opgeslagen:
+De I2C-sensorcommunicatie verloopt in de volgende stappen:
 
-    double temp = (double)((raw_data[0] << 8) | raw_data[1]);
-    temp = (temp * 175.72 / 65536) - 46.85;
-    ESP_LOGI(TAG, "Temperature: %.2f", temp);
-    sensor_data.temp = temp;
+*   Initialisatie I2C-bus: De code initialiseert de I2C-bus met behulp van de i2c_master_init()-functie uit de i2c_master.h-bibliotheek. 
+    Hierbij worden de instellingen voor de bus gedefinieerd, zoals de SDA- en SCL-pins, het poortnummer en de pullup-weerstand.
+
+*   Aanmaken I2C-device: De i2c_master_bus_add_device()-functie wordt gebruikt om een I2C-device toe te voegen aan de bus. 
+    De instellingen voor het device worden opgeslagen in een struct van het type i2c_device_config_t, met informatie zoals het adres, 
+    de adreslengte en de verbindingssnelheid (deze waardes komen uit de datasheet van de sensor).
+
+*   Lezen sensordata: De read_sensor_data()-functie leest de sensordata. Deze functie ontvangt een pointer naar een i2c_device-struct 
+    (de eerder gemaakte struct met bus- en device-informatie) en retourneert de gemeten waardes. De functie stuurt een commando naar de sensor om de meting te starten, 
+    wacht kort op de respons, en leest vervolgens de data uit de sensor.
+*   Verwerken sensordata: De gemeten data wordt geconverteerd naar bruikbare waardes 
+    (temperatuur in °C, luchtvochtigheid in %). De berekende waardes worden opgeslagen in variabelen.
+
+2. Windsnelheidsmeting met interrupt
+
+De windsnelheidsmeting met interrupt werkt als volgt:
+
+*   Interrupt configureren: De interrupt wordt geconfigureerd voor GPIO-pin 25 met behulp van de gpio_isr_handler_add()-functie. 
+    Deze functie koppelt de gpio_isr_handler()-functie aan de interrupt en definieert de interrupt-trigger 
+    (in dit geval GPIO_INTR_POSEDGE, wat betekent dat de interrupt geactiveerd wordt bij een stijgende flank op de pin).
+
+*   Interrupt handler: De gpio_isr_handler()-functie wordt aangeroepen wanneer de interrupt wordt geactiveerd. 
+    Deze functie incrementeert een teller die het aantal interrupts registreert.
+
+*   Berekenen windsnelheid: De windsnelheid wordt berekend door de teller te delen door de tijd die is verstreken sinds de laatste interrupt. 
+    De tijd wordt gemeten met behulp van de esp_timer-bibliotheek. De tijden worden opgeslagen in een array waar de oudste waarde wordt vervangen met de meting. 
+    Het gemiddelde van de waarden wordt gebruikt om de snelheid te berekenen. Deze formule is niet perfect omdat deze afhankelijk is van de weerstand en grootte van de fysieke windmeter
+
+*   Meting plaatsen in geheugen: De berekende snelheid word opgeslagen in de sensor meting struct. wanneer niet meer gemeten wordt wordt deze gereset naar 0.
+    Dit om te voorkomen dat als de windmeter spontaan stopt, de laatste meting herhaald wordt.
+
+3. Wifi-verbinding
+
+De Wifi-verbinding wordt gemaakt met behulp van de volgende stappen:
+
+*   Flashgeheugen: Wifi-gegevens worden permanent opgeslagen in het flashgeheugen (indien nodig).
+
+*   Initialisatie: wifi_init_sta() start Wifi met standaardinstellingen en het gedefinieerde SSID/wachtwoord.
+
+*   Event handler: Een handler wordt gecreëerd om te reageren op Wifi-events (verbinding gemaakt/verbroken etc.).
+
+4. MQTT-verbinding
+
+*   Initialisatie: De eigenschappen van de MQTT verbinding worden gedefinieerd. Met deze eigenschappen wordt een instantie van de MQTT client gestart (uit mqtt_client.h)
+
+*   Event handler: Een MQTT-event handler wordt gecreëerd om te reageren op MQTT-events (verbinding, data-ontvangst etc.).
+
+*   Foutenafhandeling: De handler behandelt fouten en print debug-informatie.
+
+5. MQTT data verstuur routine
+
+In main wordt de data verstuur taak toegevoegd aan RTOS met xTaskCreate(&publish_sensor_data, "publish_sensor_data", 4096, NULL, 5, NULL);
+
+Deze definieert welke functie wordt toegevoegd, hoe deze heet (voor debug), hoeveel geheugen deze mag hebben (ik heb ruim genomen, dit kan veel minder), 
+mogelijke ingangsdata (niet nodig dus NULL), prioriteit (niet heel hoog, dus 5) en een task handle (niet nodig, wordt gebruikt als je later de taak wil bewerken, verwijderen etc.)
+
+Publish_sensor_data() bevat een while(1) loop (aka eindeloos). Maar omdat dit in een taak wordt aangeroepen zal RTOS deze beheren, 
+waardoor deze loopt afhankelijk van prioriteit etc.
+
+De publish_sensor_data() functie leest als eerste de sensor data van de i2c sensor. Vervolgens worden alle sensormetingen omgezet naar strings 
+zodat deze via mqtt verstuurd kunnen worden.
+
+6. Schakeling wind sensor
+
+De schakeling bestaat uit een magneet relais (normaal open) dat schakelt wanneer een magnetisch veld aanwezig is. 
+Het relais was oorspronkelijk alleen verbonden met een pullup-weerstand, waardoor de spanning werd gemeten wanneer er 
+kortsluiting was naar aarde en de pin dus van hoog naar laag ging.
+
+Dit introduceerde een probleem: de meting is zo snel dat bij elke schakeling meerdere keren een signaal wordt gemeten. 
+Dit komt doordat de schakelaar bij het sluiten niet perfect contact maakt en een paar keer trilt. 
+Hierdoor ontstaat op het moment van schakelen een kort hoogfrequent signaal.
+
+Om dit te voorkomen is een low-pass filter toegepast. Deze filtert het hoogfrequente signaal uit de schakeling. 
+Hierdoor worden de trillingen gelijkgetrokken, maar de gemiddelde spanning op deze momenten zal dalen.
+
+Dit maakt een nieuw probleem duidelijk: het signaal bevindt zich nu een deel van de tijd in een niet gedefinieerd gebied. 
+De pins van de ESP32 meten "hoog" vanaf ~80% van VCC en "laag" vanaf ~20% VCC. Het gebied hiertussen; 20% tot 80%, is niet gedefinieerd en resulteert in onverwachte resultaten, 
+vooral als het signaal bijvoorbeeld net onder en net boven de 80% trilt.
+
+Hierdoor is de filter niet genoeg om het probleem van extra metingen op te lossen. De volgende stap is het toepassen van een SCHMITT trigger IC. 
+Dit is een NOT-gate die het signaal versterkt naar een van de uiteinden van het meetgebied.
+
+Er is een hoge grens "Vr+" en een lage grens "Vr-". Als een signaal boven de hoge grens komt, wordt de uitvoer gelijk aan VCC. 
+Deze wordt pas nul wanneer het ingangssignaal onder de lage grens komt. Zo is elk gebied tussen nul en VCC gedefinieerd en kan het 
+gefilterde signaal correct worden gelezen door de ESP32.
+
+7. Overige opmerkingen
+
+*   De code is voorzien van uitgebreide commentaren in het Engels.
+
+*   De code is nu niet ideaal door tijd en scope limieten. Geheugengebruik en structuur kunnen worden verbeterd in een eindproduct. 
+    Vooral het feit dat alle functies in een bestand zitten, Deze zouden voor leesbaaheid opgesplitst kunnen worden in losse delen voor WIFI, MQTT, I2C etc.
     
-De luchtvochtigheid wordt op dezelfde manier verkregen direct hierna en wordt ook opgeslagen in het geheugen.
- 
-Interrupt wind snelheid
-De windsnelheid wordt gemeten door de snelheid van pulsen te gebruiken met een interrupt routine. Eerst zal even de schakeling besproken worden die dit mogelijk maakt.
-Schakeling
- 
-Figuur 2, Foto schakeling
- 
-Figuur 3, Schema schakeling (Figuren in .pdf)
+Bewijs van functionaliteit
 
-In Figuur 2 en Figuur 3 staat de schakeling afgebeeld die gebruikt wordt voor de windsnelheidsmeting. De windsnelheid zal bepaald worden door het meten hoe vaak de magneet wordt gedetecteerd. Dit geeft een snelheidsmeting van de as, deze kan omgerekend worden naar windsnelheid. Figuur 4 weergeeft een schets van het concept:
- 
-Figuur 4, schets concept
-De schakeling bestaat uit een magneet relais (normally open) dat schakelt wanneer een magnetisch veld aanwezig is. Het relais was origineel alleen verbonden met een pullup weerstand, zo werd gemeten wanneer kortgesloten werd naar aarde en dus de pin van hoog naar laag ging. Dit introduceerde een probleem; De meting is zo snel dat bij iedere schakeling meerdere keren een signaal wordt gemeten.
-Dit komt doordat de schakelaar niet perfect contact maakt bij de sluiting, en een aantal keer trilt. Zo ontstaat op moment van schakeling een kort hoogfrequent signaal (zie figuur 
- 
-Figuur 5, schakeling trilling
-Om dit te voorkomen is een low-pass filter toegepast, deze filtert het hoog frequente signaal uit de schakeling. Deze trekt de trillingen gelijk, maar de gemiddelde spanning op deze momenten zal dalen. Figuur 6 weergeeft boven nu een gefilterd signaal. 
- 
-Figuur 6, Low-Pass filter en ideaal
-Dit maakt een nieuw probleem duidelijk, het signaal bevindt zich nu een deel van de tijd in een niet gedefinieerd gebied. De pins van de esp32 meten “hoog” vanaf ~80% van VCC en laag vanaf ~20% VCC, het gebied hiertussen; 20% tm 80% is niet gedefinieerd en resulteerd in onverwachte resultaten, vooral als het signaal bijvoorbeeld vlak onder en vlak boven de 80% trilt. 
-Hierdoor is de filter niet genoeg om het probleem van extra metingen op te lossen. De volgende stap is het toepassen van een SCHMITT trigger IC. Dit is een Not gate die het signaal versterkt naar een van de uiteindes van het meetgebied. 
-Dit werkt zoals afgebeeld op Figuur 6. Er is een hoog grens “Vr+” en een laag grens “Vr-“. Als een signaal boven de hoog grens komt wordt de output gelijk aan VCC. Deze wordt pas nul wanneer het ingangssignaal onder de laag grens komt. Zo is ieder gebied tussen nul en VCC gedefinieerd en kan het gefilterde signaal correct gelezen worden door de ESP32.
-Code
-Voor de meting wordt GPIO 25 gebruikt. Eerst worden de relevante instellingen opgeslagen in een struct van de gpio.h bibliotheek. De instellingen worden toegepast met de gpio_config() functie. 
-    
-    gpio_config_t io_conf = {};                  
-    io_conf.intr_type = GPIO_INTR_POSEDGE
-    io_conf.pin_bit_mask = GPIO_INTR_PIN_SEL
-    io_conf.mode = GPIO_MODE_INPUT;
-    io_conf.pull_up_en = 0;
-    gpio_config(&io_conf);  
+De functionaliteit van de code is getest door de debug-uitvoer te bekijken en de MQTT-data te controleren in een MQTT-explorer.
 
-Het Is zeer belangrijk dat de meting wordt geregistreerd direct wanneer de pin laag wordt, om dit te garanderen worden interrupts gebruikt. Eerst wordt een queue geregistreerd waar interrupt taken kunnen worden opgeslagen; dit garandeert dat een interrupt altijd verwerkt wordt en niet wordt onderbroken door een andere interrupt. 
-Vervolgens word een taak toegevoegd die de geregistreerde queue afhandeld. Dit is vergelijkbaar met een loop en loopt constant, maar met het verschil dat de activiteit hiervan wordt gemanaged door FREERTOS. (Dit is een soort van OS voor embedded die taken en meer beheert, een groot deel van de uitleg laat ik buiten beschouwing omdat dit verslag al te uitgebreid wordt.) 
-Hierna wordt de interrupt geregistreerd met gpio_isr_handler_add(). Deze voegt ook de functie toe die wordt aangeroepen wanneer geinterrupt wordt. (in dit geval gpio_isr_handler(). Deze voegt benodigde informatie toe aan de queue.)  
+Conclusie
 
-Figuur 7, interrupts
+De code is met succes geïmplementeerd en functioneert zoals verwacht. De code verzamelt sensordata, verstuurt deze via MQTT en toont de data in de MQTT-explorer.
 
-Een ruwe representatie van de loop van de code is afgebeeld in Figuur 7. De code is nog iets gedetailleerder, voor verdere info kan naar de comments gekeken worden.
+Opmerkingen:
 
-Wifi & MQTT verbinding
-
-De volgende uitleg is beknopt omdat dit grotendeels boilerplate is van het mqtt en wifi voorbeeld van espressif.
-Wat flash ruimte wordt vrijgemaakt om wifi gegevens permanent op te slaan. (alleen als niet al beschikbaar)
-De wifi_init_sta() functie start de wifi, de instellingen zijn standaard en het gebruikt het gedefineerde SSID en wachtwoord bovenin de code.
-Ook wordt een handler aangemaakt die geroepen wordt bij events van de esp_wifi.h bibliotheek. Dit bepaalt wat de code doet wanneer verbinding wordt gemaakt, verbroken etc.
-Als de wifi verbonden is wordt de MQTT client gestart met mqtt_start(). Deze definieert de instellingen voor de verbinding met de mqtt://broker.hivemq.com.
-Vervolgens wordt een MQTT event handler aangemaakt. De mqtt_client.h bibliotheek regelt dat bij verschillende gebeurtenissen zoal verbinding, data-ontvangst etc. signalen worden uitgestuurd. De handler definieert wat de code moet doen bij ieder signaal.
-In ons geval wordt alleen rekening gehouden met wanneer iets fout gaat en iets wordt verstuurd. In beide gevallen wordt in debug geprint wat er is gebeurd.
-
-MQTT data versturen
-
-In main wordt de data verstuur taak toegevoegd aan RTOS:
-
-xTaskCreate(&publish_sensor_data, "publish_sensor_data", 4096, NULL, 5, NULL);
-
-Deze definieert welke functie wordt toegevoegd, hoe deze heet (voor debug), hoeveel geheugen deze mag hebben (ik heb ruim genomen, dit kan veel minder), mogelijke ingangsdata (niet nodig dus NULL), prioriteit (niet heel hoog, dus 5) en een task handle (niet nodig, wordt gebruikt als je later de taak wil bewerken, verwijderen etc.
-Publish_sensor_data() bevat een while(1) loop (aka eindeloos). Maar omdat dit in een taak wordt aangeroepen zal RTOS deze beheren, waardoor deze loopt afhankelijk van prioriteit etc.
-De publish_sensor_data() functie leest als eerste de sensor data van de i2c sensor. Vervolgens worden alle sensormetingen omgezet naar strings zodat deze via mqtt verstuurd kunnen worden. Figuur 8 beeld de loop van de code grofweg af.
- 
-Figuur 8, data versturen
-
-Vervolgens wordt iedere meting individueel verstuurd naar zijn respectievelijke topic.
-Overig
-Ik heb delen van de uitleg in dit document beknopt gehouden, maar heb uitgebreide comments aan mijn code toegevoegd. (Comments zijn zeer uitgebreid, in werkelijke code zou ik dit beknopter doen, maar wilde extra duidelijkheid omdat dit een school opdracht is.) De comments zijn wel in het Engels, bij coderen vind ik dit prettiger omdat de code en documentatie zelf ook in het Engels is.
-Een aantal beslissingen betreffende geheugen en structuur van de code is niet ideaal, ik heb dit nu gedaan door tijdsbeperking en limitatie van scope van de opdracht. Bij een eindproduct van een bedrijf zouden de wifi, mqtt, main, i2c en meetlogica opgesplitst worden in verschillende bestanden, en zou meer tijd gestoken worden in verschillende geheugen optimalisaties.
-Functie bewijs:
-De volgende afbeeldingen laten de debug zien bij versturen van MQTT berichten en interrupts. Die erna weergeven MQTT explorer met de ontvangen data en grafieken. Deze zijn allen functioneel.
- 
-    
-
+In deze tekstversie zijn de figuren uit de originele documentatie vervangen door beschrijvingen.
+De code is niet opgenomen in deze tekstversie.
+Raadpleeg de originele documentatie met figuren voor meer details over de code en de functionaliteit.
