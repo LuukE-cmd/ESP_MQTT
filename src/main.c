@@ -45,7 +45,7 @@ static EventGroupHandle_t s_wifi_event_group;
 #define GPIO_INTR_PIN 25
 #define GPIO_INTR_PIN_SEL (1ULL<<GPIO_INTR_PIN)
 #define ESP_INTR_FLAG_DEFAULT 0
-#define DEBOUNCE_TIME 175 // 225 microseconds debounce
+#define DEBOUNCE_TIME 50 // 225 microseconds debounce
 
 // GPIO AVERAGE VARIABLE DEFINITIONS
 #define ARRAY_SIZE 10 // Size of the array to store the time differences between the last interrupt and the current interrupt.
@@ -57,8 +57,11 @@ static int array_index = 0; // Index to keep track of the current position in th
 
 // I2C SENSOR DEFINITIONS
 #define I2C_SENSOR_PORT I2C_NUM_0
-#define I2C_SDA_PIN 13
-#define I2C_SCL_PIN 12
+#define I2C_SDA_PIN 21
+#define I2C_SCL_PIN 22
+#define I2C_SENSOR_ADDR 0x40
+#define I2C_SENSOR_TEMP_REG 0xF3
+#define I2C_SENSOR_HUMIDITY_REG 0xF5
 
 static int64_t last_interrupt_time = 0; 
 
@@ -78,7 +81,21 @@ typedef struct {
     double humidity;
 } sensor_data_t;
 
-static sensor_data_t sensor_data;
+// Structure to store the i2c master bus handle and the i2c master device handle. 
+// This is only used because there is only one i2c device in this project.
+// In real applications the bus and device handles shlould be handled separately.
+typedef struct {
+    i2c_master_bus_handle_t bus_handle;
+    i2c_master_dev_handle_t dev_handle;
+} i2c_device;
+
+static i2c_device i2c_zuyd_sensor; // Create a global i2c device struct to store the i2c bus and device handles.
+
+static sensor_data_t sensor_data; // Create a global sensor data struct to store the sensor data. 
+
+//static void i2c_scanner(i2c_master_bus_handle_t bus_handle); // Uncomment to scan the i2c bus for devices.
+
+static void read_sensor_data(i2c_device* device);
 
 // this function is called when an interrupt is triggered on the GPIO pin
 static void IRAM_ATTR gpio_isr_handler(void* arg)
@@ -100,7 +117,7 @@ static void IRAM_ATTR gpio_isr_handler(void* arg)
     last_interrupt_time = current_time;                 // Set the last interrupt time to the current time.
 }
 
-// this function is called when an interrupt is triggered on the GPIO pin
+// this function is called when an item is received in the gpio event queue. 
 static void gpio_task_example(void* arg)
 {
     gpio_info_t *gpio_info; // Create a gpio info struct.
@@ -157,13 +174,13 @@ void app_main(void) {
 
 ////////////////////I2C CONFIGURATION//////////////////////
     ESP_LOGI(TAG, "I2C master initialization");                     // Log that the i2c master is being initialized.
-    i2c_master_init();                                          // Initialize the i2c master bus and device.
+    i2c_master_init();                                          // Initialize the i2c master bus and device. 
 
 ///////////////////GPIO INTERRUPT CONFIGURATION//////////////////////
     printf("\n");
     ESP_LOGI(TAG, "GPIO interrupt configuration");                  // Log that the gpio interrupt is being configured.
     gpio_config_t io_conf = {};                                   // Create a gpio configuration struct.
-    io_conf.intr_type = GPIO_INTR_NEGEDGE;                        // Set the interrupt type to negative edge. This means that the interrupt will be triggered when the pin goes from high to low.
+    io_conf.intr_type = GPIO_INTR_POSEDGE;                        // Set the interrupt type to negative edge. This means that the interrupt will be triggered when the pin goes from high to low.
     io_conf.pin_bit_mask = GPIO_INTR_PIN_SEL;                 // Set the pin bit mask to the GPIO_INTR_PIN. This is the pin that the interrupt will be triggered on.
     io_conf.mode = GPIO_MODE_INPUT;                               // Set the mode to input. This means that the pin will be used as an input.
     io_conf.pull_up_en = 0;                                       // Enable the pull-up resistor. This means that the pin will be pulled up to 3.3V when it is not connected to anything.
@@ -176,7 +193,6 @@ void app_main(void) {
     gpio_install_isr_service(ESP_INTR_FLAG_DEFAULT);              // Install the gpio isr service. This is used to handle the gpio interrupts.
     gpio_isr_handler_add(GPIO_INTR_PIN, gpio_isr_handler, (void*) GPIO_INTR_PIN); // Add the gpio isr handler. This is used to handle the gpio interrupts on the GPIO_INTR_PIN.
 
-    //printf("minimum free heap size: %u bytes\n", esp_get_minimum_free_heap_size()); // Print the minimum free heap size. This is the minimum amount of memory that is available to the application.
 
 ///////////////////WIFI AND MQTT CONFIGURATION//////////////////////
 
@@ -371,6 +387,8 @@ static void publish_sensor_data(void* pvParameters) {
     ESP_LOGI(TAG, "Publishing sensor data...");                             // Log that the sensor data is being published.
     while (1) {                                                             // Initialize loop for simulating sensor reading.
     
+    read_sensor_data(&i2c_zuyd_sensor);                                     // Read the sensor data from the i2c sensor.
+
     char str_speed[12];                                                      // Create a char array to store the speed as a string. MQTT messages must be a string (max 12 characters)
     sprintf(str_speed, "%.2f", sensor_data.speed);                            // Convert the speed to a string.
     sensor_data.speed = 0;                                                  // Reset the speed to 0.
@@ -387,30 +405,98 @@ static void publish_sensor_data(void* pvParameters) {
 
 static void i2c_master_init() {
 
+    // configuration for the i2c bus
     i2c_master_bus_config_t bus_config = {
-        .clk_source = I2C_CLK_SRC_DEFAULT,
-        .i2c_port = I2C_SENSOR_PORT,
-        .sda_io_num = I2C_SDA_PIN,
-        .scl_io_num = I2C_SCL_PIN,
-        .glitch_ignore_cnt = 7,
-        .flags.enable_internal_pullup = true,
+        .clk_source = I2C_CLK_SRC_DEFAULT,          // Set the clock source to the default clock source.
+        .i2c_port = I2C_SENSOR_PORT,                // Set the i2c port to the I2C_SENSOR_PORT defined at the top of the file.
+        .sda_io_num = I2C_SDA_PIN,                  // Set the sda pin to the I2C_SDA_PIN defined at the top of the file.
+        .scl_io_num = I2C_SCL_PIN,                  // Set the scl pin to the I2C_SCL_PIN defined at the top of the file.
+        .glitch_ignore_cnt = 7,                     // Set the glitch ignore count to 7. This is the number of clock cycles to ignore when detecting a glitch.
+        .flags.enable_internal_pullup = true,       // Enable the internal pullup resistor.
     };
-
+    
     i2c_master_bus_handle_t bus_handle;
     ESP_ERROR_CHECK(i2c_new_master_bus(&bus_config, &bus_handle));
+    i2c_zuyd_sensor.bus_handle = bus_handle;                        // Set the i2c bus handle to the staticly defined i2c_zuyd_sensor struct. 
 
+    // i2c_scanner(bus_handle); // Uncomment to scan the i2c bus for devices.
+
+
+    // configuration for the Si7021 sensor
     i2c_device_config_t dev_cfg = {
         .dev_addr_length = 7,
-        .device_address = 0x44,
+        .device_address = I2C_SENSOR_ADDR,
         .scl_speed_hz = 100000,
     };
 
+    // add the Si7021 sensor to the i2c bus
     i2c_master_dev_handle_t dev_handle;
     ESP_ERROR_CHECK(i2c_master_bus_add_device(bus_handle, &dev_cfg, &dev_handle));
-    esp_err_t ret = i2c_master_probe(bus_handle, 0x44, 300);
+    i2c_zuyd_sensor.dev_handle = dev_handle;                        // Set the i2c device handle to the staticly defined i2c_zuyd_sensor struct.
+
+    // test if the sensor is connected to the i2c bus
+    esp_err_t ret = i2c_master_probe(bus_handle, I2C_SENSOR_ADDR, 300);
     if (ret == ESP_OK) {
         ESP_LOGI(TAG, "I2C device found");
     } else {
         ESP_LOGE(TAG, "I2C device not found");
     }
+    read_sensor_data(&i2c_zuyd_sensor);
 }
+
+// sensor reading according to the Si7021 datasheet and https://docs.espressif.com/projects/esp-idf/en/stable/esp32/api-reference/peripherals/i2c.html#i2c_master_controller
+// tried to implement the read-write functions according to the datasheet, but the sensor did not respond to the commands (got max value 65535 for both temperature and humidity every measurement)
+
+static void read_sensor_data(i2c_device* device) {
+    uint8_t cmd[1];
+    cmd[0] = I2C_SENSOR_TEMP_REG; // Measure Temperature, No Hold Master Mode
+
+    // Write the measure command to the sensor
+    ESP_ERROR_CHECK(i2c_master_transmit(device->dev_handle, cmd, sizeof(cmd), -1));
+
+    // Delay to allow the sensor to perform the measurement
+    // The maximum measurement time for the Si7021 is 12ms for temperature
+    vTaskDelay(pdMS_TO_TICKS(20));
+
+    uint8_t raw_data[2];
+
+    // Read the measurement data from the sensor
+    ESP_ERROR_CHECK(i2c_master_receive(device->dev_handle, raw_data, sizeof(raw_data), -1));
+
+    double temp = (double)((raw_data[0] << 8) | raw_data[1]);
+    //ESP_LOGI(TAG, "Temperature raw: %.2f", temp);
+    temp = (temp * 175.72 / 65536) - 46.85;
+    ESP_LOGI(TAG, "Temperature: %.2f", temp);
+    sensor_data.temp = temp;
+
+    cmd[0] = I2C_SENSOR_HUMIDITY_REG; // Measure Humidity, No Hold Master Mode
+    ESP_ERROR_CHECK(i2c_master_transmit(device->dev_handle, cmd, sizeof(cmd), -1));
+
+    vTaskDelay(pdMS_TO_TICKS(20));
+
+    // Read the measurement data from the sensor
+    ESP_ERROR_CHECK(i2c_master_receive(device->dev_handle, raw_data, sizeof(raw_data), -1));
+    double humidity = (double)((raw_data[0] << 8) | raw_data[1]);
+    //ESP_LOGI(TAG, "Humidity raw: %.2f", humidity);
+    humidity = (humidity * 125 / 65536) - 6;
+    ESP_LOGI(TAG, "Humidity: %.2f", humidity);
+    sensor_data.humidity = humidity;
+}
+
+// This function is used to scan the i2c bus for devices. It will log the devices that are found on the i2c bus.
+
+// static void i2c_scanner(i2c_master_bus_handle_t bus_handle) {
+//     ESP_LOGI(TAG, "Scanning I2C bus...");
+
+//     for (uint8_t addr = 1; addr < 128; addr++) {
+//         esp_err_t ret = i2c_master_probe(bus_handle, addr, 1000);
+//         if (ret == ESP_OK) {
+//             ESP_LOGI(TAG, "I2C device found at address 0x%02X", addr);
+//         } else if (ret == ESP_ERR_TIMEOUT) {
+//             ESP_LOGI(TAG, "I2C bus is busy or device not responding at 0x%02X", addr);
+//         } else {
+//             ESP_LOGI(TAG, "Unknown error at address 0x%02X", addr);
+//         }
+//     }
+//     ESP_LOGI(TAG, "I2C scan completed.");
+// }
